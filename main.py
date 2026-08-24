@@ -6,12 +6,12 @@ import yfinance as yf
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse, RedirectResponse
 
 app = FastAPI(title="Indian Algo Trading Engine")
 
 DATABASE_URL = os.getenv("DATABASE_URL")
-INITIAL_CASH = 1000.0
+INITIAL_CASH = 50000.0
 WATCHLIST = [
     "SBIN.NS", "TATAMOTORS.NS", "ITC.NS", "INFY.NS", "RELIANCE.NS",
     "HDFCBANK.NS", "ICICIBANK.NS", "BHARTIARTL.NS", "TCS.NS", "AXISBANK.NS"
@@ -54,6 +54,11 @@ def init_db():
                     status TEXT,
                     reason TEXT
                 );
+                CREATE TABLE IF NOT EXISTS valuation_history (
+                    id SERIAL PRIMARY KEY,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    total_value REAL
+                );
                 INSERT INTO portfolio (id, cash) VALUES (1, %s) ON CONFLICT DO NOTHING;
             """, (INITIAL_CASH,))
             conn.commit()
@@ -65,13 +70,14 @@ async def startup_event():
 
 def fetch_live_prices(symbols):
     prices = {}
-    tickers = yf.Tickers(" ".join(symbols))
     for sym in symbols:
         try:
-            info = tickers.tickers[sym].fast_info
-            prices[sym] = float(info.last_price)
-        except Exception:
-            pass
+            ticker = yf.Ticker(sym)
+            hist = ticker.history(period="2d")
+            if not hist.empty:
+                prices[sym] = round(float(hist['Close'].iloc[-1]), 2)
+        except Exception as e:
+            print(f"Failed to fetch {sym}: {e}")
     return prices
 
 async def trading_loop():
@@ -82,7 +88,10 @@ async def trading_loop():
                 with get_db() as conn:
                     with conn.cursor(cursor_factory=RealDictCursor) as cur:
                         cur.execute("SELECT cash FROM portfolio WHERE id=1;")
-                        cash = cur.fetchone()['cash']
+                        cash_res = cur.fetchone()
+                        cash = cash_res['cash'] if cash_res else INITIAL_CASH
+
+                        holdings_value = 0.0
 
                         for sym, price in prices.items():
                             if not price or price <= 0:
@@ -91,14 +100,13 @@ async def trading_loop():
                             cur.execute("SELECT * FROM holdings WHERE symbol=%s;", (sym,))
                             position = cur.fetchone()
 
-                            # DECISION LOGIC & REJECTION REASONS
                             if position:
                                 buy_price = position['buy_price']
+                                qty = position['qty']
+                                holdings_value += (qty * price)
                                 pnl_pct = ((price - buy_price) / buy_price) * 100.0
 
                                 if pnl_pct >= 1.5 or pnl_pct <= -1.0:
-                                    # SELL EXECUTION
-                                    qty = position['qty']
                                     revenue = round(qty * price, 2)
                                     cash += revenue
 
@@ -112,35 +120,34 @@ async def trading_loop():
                                     reason = f"TARGET HIT ({'PROFIT +1.5%' if pnl_pct>=1.5 else 'STOP LOSS -1.0%'})"
                                     cur.execute("INSERT INTO decision_logs (symbol, price, status, reason) VALUES (%s, %s, 'EXECUTED SELL', %s);", (sym, price, reason))
                                 else:
-                                    reason = f"HOLDING: Current P&L is {pnl_pct:.2f}% (Target: +1.5% / -1.0%)"
+                                    reason = f"HOLDING: P&L is {pnl_pct:+.2f}% (Target: +1.5% / -1.0%)"
                                     cur.execute("INSERT INTO decision_logs (symbol, price, status, reason) VALUES (%s, %s, 'HOLD', %s);", (sym, price, reason))
 
                             else:
-                                if price > 1000:
-                                    reason = f"REJECTED: Price ₹{price:.2f} exceeds ₹1000 ceiling limit"
-                                    cur.execute("INSERT INTO decision_logs (symbol, price, status, reason) VALUES (%s, %s, 'REJECTED', %s);", (sym, price, reason))
-                                elif cash < price:
+                                max_qty = int(cash // price)
+                                if max_qty > 0:
+                                    qty = 1
+                                    cost = round(qty * price, 2)
+                                    cash -= cost
+
+                                    cur.execute("UPDATE portfolio SET cash=%s WHERE id=1;", (cash,))
+                                    cur.execute("INSERT INTO holdings (symbol, qty, buy_price) VALUES (%s, %s, %s);", (sym, qty, price))
+                                    cur.execute("""
+                                        INSERT INTO ledger (symbol, action, qty, price, total_value, balance)
+                                        VALUES (%s, 'BUY', %s, %s, %s, %s);
+                                    """, (sym, qty, price, cost, cash))
+
+                                    reason = f"APPROVED: Bought {qty} qty at ₹{price:.2f}"
+                                    cur.execute("INSERT INTO decision_logs (symbol, price, status, reason) VALUES (%s, %s, 'EXECUTED BUY', %s);", (sym, price, reason))
+                                else:
                                     reason = f"REJECTED: Insufficient cash balance (₹{cash:.2f}) for stock price ₹{price:.2f}"
                                     cur.execute("INSERT INTO decision_logs (symbol, price, status, reason) VALUES (%s, %s, 'REJECTED', %s);", (sym, price, reason))
-                                else:
-                                    # BUY EXECUTION
-                                    qty = int(cash // price)
-                                    if qty > 0:
-                                        cost = round(qty * price, 2)
-                                        cash -= cost
 
-                                        cur.execute("UPDATE portfolio SET cash=%s WHERE id=1;", (cash,))
-                                        cur.execute("INSERT INTO holdings (symbol, qty, buy_price) VALUES (%s, %s, %s);", (sym, qty, price))
-                                        cur.execute("""
-                                            INSERT INTO ledger (symbol, action, qty, price, total_value, balance)
-                                            VALUES (%s, 'BUY', %s, %s, %s, %s);
-                                        """, (sym, qty, price, cost, cash))
+                        total_portfolio_valuation = round(cash + holdings_value, 2)
+                        cur.execute("INSERT INTO valuation_history (total_value) VALUES (%s);", (total_portfolio_valuation,))
 
-                                        reason = f"APPROVED: Cash available (₹{cash+cost:.2f}), Bought {qty} qty"
-                                        cur.execute("INSERT INTO decision_logs (symbol, price, status, reason) VALUES (%s, %s, 'EXECUTED BUY', %s);", (sym, price, reason))
-
-                        # Clean up old logs to keep database fast (keep last 100 entries)
                         cur.execute("DELETE FROM decision_logs WHERE id NOT IN (SELECT id FROM decision_logs ORDER BY id DESC LIMIT 100);")
+                        cur.execute("DELETE FROM valuation_history WHERE id NOT IN (SELECT id FROM valuation_history ORDER BY id DESC LIMIT 100);")
                         conn.commit()
 
         except Exception as e:
@@ -156,24 +163,24 @@ def web_dashboard():
     with get_db() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("SELECT cash FROM portfolio WHERE id=1;")
-            cash = cur.fetchone()['cash']
+            cash_row = cur.fetchone()
+            cash = cash_row['cash'] if cash_row else INITIAL_CASH
+            
             cur.execute("SELECT * FROM holdings;")
             holdings = cur.fetchall()
             cur.execute("SELECT * FROM ledger ORDER BY id DESC LIMIT 25;")
             ledger = cur.fetchall()
             cur.execute("SELECT * FROM decision_logs ORDER BY id DESC LIMIT 15;")
             decisions = cur.fetchall()
-            
-            # Data for Chart
-            cur.execute("SELECT timestamp, balance FROM ledger ORDER BY id ASC;")
-            chart_data = cur.fetchall()
+            cur.execute("SELECT timestamp, total_value FROM valuation_history ORDER BY id ASC;")
+            history = cur.fetchall()
 
-    chart_labels = [str(c['timestamp']).split()[1][:5] for c in chart_data] if chart_data else ["Start"]
-    chart_balances = [c['balance'] for c in chart_data] if chart_data else [INITIAL_CASH]
+    chart_labels = [str(h['timestamp']).split()[1][:8] for h in history] if history else ["Now"]
+    chart_values = [h['total_value'] for h in history] if history else [INITIAL_CASH]
 
-    holdings_rows = "".join([f"<tr><td class='p-2'>{h['symbol']}</td><td class='p-2'>{h['qty']}</td><td class='p-2'>₹{h['buy_price']}</td></tr>" for h in holdings])
+    holdings_rows = "".join([f"<tr class='border-b border-slate-800'><td class='p-2 font-semibold'>{h['symbol']}</td><td class='p-2'>{h['qty']}</td><td class='p-2'>₹{h['buy_price']}</td></tr>" for h in holdings])
     ledger_rows = "".join([
-        f"<tr class='border-b border-slate-800'><td class='p-2'>{l['timestamp']}</td><td class='p-2'>{l['symbol']}</td><td class='p-2 {('text-emerald-400' if l['action']=='BUY' else 'text-rose-400')}'>{l['action']}</td><td class='p-2'>{l['qty']}</td><td class='p-2'>₹{l['price']}</td><td class='p-2'>{(str(round(l['pnl_pct'],2))+'%') if l['pnl_pct'] is not None else '-'}</td><td class='p-2'>₹{l['balance']:.2f}</td></tr>"
+        f"<tr class='border-b border-slate-800'><td class='p-2 text-slate-400'>{str(l['timestamp']).split()[1][:8]}</td><td class='p-2 font-semibold'>{l['symbol']}</td><td class='p-2 {('text-emerald-400' if l['action']=='BUY' else 'text-rose-400')}'>{l['action']}</td><td class='p-2'>{l['qty']}</td><td class='p-2'>₹{l['price']}</td><td class='p-2'>{(str(round(l['pnl_pct'],2))+'%') if l['pnl_pct'] is not None else '-'}</td><td class='p-2 font-mono'>₹{l['balance']:.2f}</td></tr>"
         for l in ledger
     ])
     decision_rows = "".join([
@@ -185,7 +192,7 @@ def web_dashboard():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Live Algo Trading Dashboard</title>
+        <title>Live Algo Trading Engine</title>
         <script src="https://cdn.tailwindcss.com"></script>
         <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
         <meta http-equiv="refresh" content="10">
@@ -195,11 +202,14 @@ def web_dashboard():
             <div class="flex justify-between items-center bg-slate-900 p-6 rounded-xl border border-slate-800">
                 <div>
                     <h1 class="text-2xl font-bold text-emerald-400">Live Trade Action Register</h1>
-                    <p class="text-slate-400 text-sm">Status: Running 24/7 | Live Rejection Reason Tracking</p>
+                    <p class="text-slate-400 text-sm">Status: Scanning Live | Continuous Graph Tracking Active</p>
                 </div>
-                <div class="text-right">
-                    <div class="text-xs text-slate-400">Demo Cash Balance</div>
-                    <div class="text-3xl font-extrabold text-white">₹{cash:.2f}</div>
+                <div class="flex items-center gap-6">
+                    <div class="text-right">
+                        <div class="text-xs text-slate-400">Available Cash</div>
+                        <div class="text-3xl font-extrabold text-white">₹{cash:.2f}</div>
+                    </div>
+                    <a href="/reset-cash" class="bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold py-2 px-3 rounded-lg border border-slate-700">🔄 Reset Cash (₹50k)</a>
                 </div>
             </div>
 
@@ -208,13 +218,11 @@ def web_dashboard():
                 <a href="/export/csv" class="bg-blue-600 hover:bg-blue-500 text-white font-bold py-2 px-4 rounded-lg">📄 Download CSV Report</a>
             </div>
 
-            <!-- PORTFOLIO PERFORMANCE GRAPH -->
             <div class="bg-slate-900 p-6 rounded-xl border border-slate-800">
-                <h2 class="text-lg font-semibold mb-4 text-emerald-400">Portfolio Performance Curve</h2>
+                <h2 class="text-lg font-semibold mb-4 text-emerald-400">Live Portfolio Valuation Curve (Cash + Stocks)</h2>
                 <canvas id="balanceChart" height="80"></canvas>
             </div>
 
-            <!-- LIVE REJECTION & DECISION REGISTER -->
             <div class="bg-slate-900 p-6 rounded-xl border border-slate-800">
                 <h2 class="text-lg font-semibold mb-4 text-amber-400">Live Decision & Rejection Register</h2>
                 <table class="w-full text-left text-sm text-slate-300">
@@ -249,12 +257,13 @@ def web_dashboard():
                 data: {{
                     labels: {chart_labels},
                     datasets: [{{
-                        label: 'Cash Balance (₹)',
-                        data: {chart_balances},
+                        label: 'Portfolio Valuation (₹)',
+                        data: {chart_values},
                         borderColor: '#10b981',
                         backgroundColor: 'rgba(16, 185, 129, 0.1)',
                         fill: true,
-                        tension: 0.3
+                        tension: 0.2,
+                        pointRadius: 2
                     }}]
                 }},
                 options: {{
@@ -270,6 +279,15 @@ def web_dashboard():
     </body>
     </html>
     """
+
+@app.get("/reset-cash")
+def reset_cash():
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE portfolio SET cash=%s WHERE id=1;", (INITIAL_CASH,))
+            cur.execute("DELETE FROM holdings;")
+            conn.commit()
+    return RedirectResponse(url="/")
 
 @app.get("/export/excel")
 def export_excel():
