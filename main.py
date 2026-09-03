@@ -29,7 +29,7 @@ app = FastAPI(title="Quant Engine V2 - Indian Paper Trading")
 # -----------------------------
 # Configuration
 # -----------------------------
-DATABASE_URL = os.getenv("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")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 INITIAL_CASH = float(os.getenv("INITIAL_CASH", "50000"))
 RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.0075"))       # 0.75%
