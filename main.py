@@ -104,12 +104,14 @@ def get_db():
 
 
 def init_db():
+    """Create the required tables and migrate older database schemas safely."""
     if not DATABASE_URL:
         print("DATABASE_URL not configured. Server can start, but trading is disabled.")
         return
 
     with get_db() as conn:
         with conn.cursor() as cur:
+            # Create tables if they do not exist.
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS portfolio (
@@ -124,8 +126,8 @@ def init_db():
                     symbol TEXT PRIMARY KEY,
                     qty INT NOT NULL,
                     buy_price DOUBLE PRECISION NOT NULL,
-                    stop_price DOUBLE PRECISION NOT NULL,
-                    target_price DOUBLE PRECISION NOT NULL,
+                    stop_price DOUBLE PRECISION NOT NULL DEFAULT 0,
+                    target_price DOUBLE PRECISION NOT NULL DEFAULT 0,
                     entry_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
 
@@ -136,10 +138,10 @@ def init_db():
                     action TEXT NOT NULL,
                     qty INT NOT NULL,
                     price DOUBLE PRECISION NOT NULL,
-                    total_value DOUBLE PRECISION NOT NULL,
+                    total_value DOUBLE PRECISION NOT NULL DEFAULT 0,
                     pnl_pct DOUBLE PRECISION,
                     pnl_value DOUBLE PRECISION,
-                    balance DOUBLE PRECISION NOT NULL,
+                    balance DOUBLE PRECISION NOT NULL DEFAULT 0,
                     reason TEXT
                 );
 
@@ -158,17 +160,64 @@ def init_db():
                     total_value DOUBLE PRECISION NOT NULL,
                     cash DOUBLE PRECISION NOT NULL
                 );
-
-                INSERT INTO portfolio
-                    (id, cash, starting_cash, day_start_equity, day_start_date)
-                VALUES
-                    (1, %s, %s, %s, CURRENT_DATE)
-                ON CONFLICT (id) DO NOTHING;
-                """,
-                (INITIAL_CASH, INITIAL_CASH, INITIAL_CASH),
+                """
             )
 
+            # ----------------------------------------------------
+            # Migration for databases created by earlier versions.
+            # CREATE TABLE IF NOT EXISTS does NOT add missing columns
+            # to an already-existing PostgreSQL table, so explicitly add
+            # every column this version expects.
+            # ----------------------------------------------------
+            migrations = [
+                ("portfolio", "starting_cash", "DOUBLE PRECISION NOT NULL DEFAULT 50000"),
+                ("portfolio", "day_start_equity", "DOUBLE PRECISION NOT NULL DEFAULT 50000"),
+                ("portfolio", "day_start_date", "DATE NOT NULL DEFAULT CURRENT_DATE"),
+                ("holdings", "stop_price", "DOUBLE PRECISION NOT NULL DEFAULT 0"),
+                ("holdings", "target_price", "DOUBLE PRECISION NOT NULL DEFAULT 0"),
+                ("holdings", "entry_time", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
+                ("ledger", "total_value", "DOUBLE PRECISION NOT NULL DEFAULT 0"),
+                ("ledger", "pnl_pct", "DOUBLE PRECISION"),
+                ("ledger", "pnl_value", "DOUBLE PRECISION"),
+                ("ledger", "balance", "DOUBLE PRECISION NOT NULL DEFAULT 0"),
+                ("ledger", "reason", "TEXT"),
+            ]
+
+            for table, column, definition in migrations:
+                cur.execute(
+                    f'ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {definition};'
+                )
+
+            # Backfill portfolio values for an existing row.
+            cur.execute("SELECT id, cash, starting_cash, day_start_equity, day_start_date FROM portfolio WHERE id=1;")
+            row = cur.fetchone()
+            if row is None:
+                cur.execute(
+                    """
+                    INSERT INTO portfolio (id, cash, starting_cash, day_start_equity, day_start_date)
+                    VALUES (1, %s, %s, %s, CURRENT_DATE)
+                    ON CONFLICT (id) DO NOTHING;
+                    """,
+                    (INITIAL_CASH, INITIAL_CASH, INITIAL_CASH),
+                )
+            else:
+                cash = float(row[1]) if row[1] is not None else INITIAL_CASH
+                starting_cash = float(row[2]) if row[2] is not None else INITIAL_CASH
+                day_start_equity = float(row[3]) if row[3] is not None else cash
+                cur.execute(
+                    """
+                    UPDATE portfolio
+                    SET cash=%s,
+                        starting_cash=%s,
+                        day_start_equity=%s,
+                        day_start_date=COALESCE(day_start_date, CURRENT_DATE)
+                    WHERE id=1;
+                    """,
+                    (cash, starting_cash, day_start_equity),
+                )
+
             conn.commit()
+            print("[DATABASE] Schema ready and migrations applied.")
 
 
 # ============================================================
