@@ -1,16 +1,19 @@
 import os
 import asyncio
+import json
+import urllib.request
 from datetime import datetime, timezone, timedelta
 import pandas as pd
 import yfinance as yf
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, StreamingResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 
-app = FastAPI(title="Indian Algo Trading Engine")
+app = FastAPI(title="AI-Supervised Indian Algo Trading Engine")
 
 DATABASE_URL = os.getenv("DATABASE_URL")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 INITIAL_CASH = 50000.0
 WATCHLIST = [
     "SBIN.NS", "TATAMOTORS.NS", "ITC.NS", "INFY.NS", "RELIANCE.NS",
@@ -19,18 +22,18 @@ WATCHLIST = [
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
-def to_ist_time_str(ts):
+def to_ist_datetime_str(ts):
     if not ts:
         return "-"
     if isinstance(ts, str):
         try:
             ts = datetime.fromisoformat(ts)
         except Exception:
-            return str(ts)[:8]
+            return str(ts)[:19]
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=timezone.utc)
     ist_ts = ts.astimezone(IST)
-    return ist_ts.strftime("%H:%M:%S")
+    return ist_ts.strftime("%d-%b %H:%M:%S")
 
 def is_market_open():
     now_ist = datetime.now(IST)
@@ -41,6 +44,62 @@ def is_market_open():
     if start_time <= now_ist <= end_time:
         return True, "Market Open"
     return False, f"Market Closed (NSE/BSE hours: 09:15-15:30 IST)"
+
+def calculate_technical_indicators(df):
+    if len(df) < 25:
+        return None
+    close = df['Close']
+    ema9 = close.ewm(span=9, adjust=False).mean().iloc[-1]
+    ema21 = close.ewm(span=21, adjust=False).mean().iloc[-1]
+    
+    delta = close.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / (loss + 1e-9)
+    rsi = 100 - (100 / (1 + rs)).iloc[-1]
+    
+    return {
+        "price": round(float(close.iloc[-1]), 2),
+        "ema9": round(float(ema9), 2),
+        "ema21": round(float(ema21), 2),
+        "rsi": round(float(rsi), 2)
+    }
+
+def consult_ai_supervisor(symbol, price, proposed_action, cash, indicators, pnl_pct=0.0):
+    if not GEMINI_API_KEY:
+        return True, "AI Supervisor: API Key missing, strategy execution approved."
+    
+    prompt = f"""
+    You are an expert AI Algorithmic Risk Supervisor for Indian Stock Markets (NSE/BSE).
+    Evaluate this proposed quantitative trade:
+    - Symbol: {symbol}
+    - Current Price: ₹{price}
+    - Proposed Action: {proposed_action}
+    - Technical Context: EMA9=₹{indicators.get('ema9')}, EMA21=₹{indicators.get('ema21')}, RSI={indicators.get('rsi')}
+    - Current Position P&L (%): {pnl_pct:.2f}%
+    - Available Portfolio Cash: ₹{cash:.2f}
+
+    Evaluate market conditions and risk parameters.
+    Reply ONLY in valid JSON format:
+    {{"approved": true/false, "reason": "Short concise reason (max 15 words)"}}
+    """
+    
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+    headers = {"Content-Type": "application/json"}
+    payload = json.dumps({
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.1, "response_mime_type": "application/json"}
+    }).encode("utf-8")
+
+    try:
+        req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=5) as response:
+            res_data = json.loads(response.read().decode("utf-8"))
+            text_response = res_data["candidates"][0]["content"]["parts"][0]["text"]
+            parsed = json.loads(text_response)
+            return parsed.get("approved", True), f"AI Supervisor: {parsed.get('reason', 'Approved')}"
+    except Exception as e:
+        return True, f"AI Supervisor (Fallback): Passed ({str(e)[:25]})"
 
 def get_db():
     return psycopg2.connect(DATABASE_URL)
@@ -93,46 +152,48 @@ async def startup_event():
     init_db()
     asyncio.create_task(trading_loop())
 
-def fetch_live_prices(symbols):
-    prices = {}
-    for sym in symbols:
-        try:
-            ticker = yf.Ticker(sym)
-            hist = ticker.history(period="2d")
-            if not hist.empty:
-                prices[sym] = round(float(hist['Close'].iloc[-1]), 2)
-        except Exception as e:
-            print(f"Failed to fetch {sym}: {e}")
-    return prices
-
 async def trading_loop():
     while True:
         try:
             if DATABASE_URL:
                 market_open, market_reason = is_market_open()
+                
+                # --- FIX: PREVENT MARKET CLOSED LOG SPAM ---
                 if not market_open:
                     with get_db() as conn:
-                        with conn.cursor() as cur:
-                            cur.execute(
-                                "INSERT INTO decision_logs (symbol, price, status, reason) VALUES (%s, %s, %s, %s);",
-                                ("NSE/BSE", 0.0, "MARKET CLOSED", market_reason)
-                            )
-                            cur.execute("DELETE FROM decision_logs WHERE id NOT IN (SELECT id FROM decision_logs ORDER BY id DESC LIMIT 100);")
-                            conn.commit()
-                else:
-                    prices = fetch_live_prices(WATCHLIST)
-                    with get_db() as conn:
                         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                            cur.execute("SELECT cash FROM portfolio WHERE id=1;")
-                            cash_res = cur.fetchone()
-                            cash = cash_res['cash'] if cash_res else INITIAL_CASH
+                            cur.execute("SELECT status FROM decision_logs ORDER BY id DESC LIMIT 1;")
+                            last_log = cur.fetchone()
+                            if not last_log or last_log['status'] != 'MARKET CLOSED':
+                                cur.execute(
+                                    "INSERT INTO decision_logs (symbol, price, status, reason) VALUES (%s, %s, %s, %s);",
+                                    ("NSE/BSE", 0.0, "MARKET CLOSED", market_reason)
+                                )
+                                conn.commit()
+                    # Sleep 5 minutes when market is closed to save resources
+                    await asyncio.sleep(300)
+                    continue
 
-                            holdings_value = 0.0
+                # --- ACTIVE TRADING LOGIC ---
+                with get_db() as conn:
+                    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                        cur.execute("SELECT cash FROM portfolio WHERE id=1;")
+                        cash_res = cur.fetchone()
+                        cash = cash_res['cash'] if cash_res else INITIAL_CASH
+                        holdings_value = 0.0
 
-                            for sym, price in prices.items():
-                                if not price or price <= 0:
+                        for sym in WATCHLIST:
+                            try:
+                                ticker = yf.Ticker(sym)
+                                hist = ticker.history(period="1mo", interval="15m")
+                                if hist.empty or len(hist) < 25:
                                     continue
-
+                                
+                                ind = calculate_technical_indicators(hist)
+                                if not ind:
+                                    continue
+                                
+                                price = ind['price']
                                 cur.execute("SELECT * FROM holdings WHERE symbol=%s;", (sym,))
                                 position = cur.fetchone()
 
@@ -142,54 +203,68 @@ async def trading_loop():
                                     holdings_value += (qty * price)
                                     pnl_pct = ((price - buy_price) / buy_price) * 100.0
 
-                                    if pnl_pct >= 1.5 or pnl_pct <= -1.0:
-                                        revenue = round(qty * price, 2)
-                                        cash += revenue
+                                    # Exit Conditions: Take profit at +2.5%, Stop loss at -1.2%, or Trend Reversal
+                                    sell_signal = (pnl_pct >= 2.5) or (pnl_pct <= -1.2) or (ind['ema9'] < ind['ema21'])
 
-                                        cur.execute("UPDATE portfolio SET cash=%s WHERE id=1;", (cash,))
-                                        cur.execute("DELETE FROM holdings WHERE symbol=%s;", (sym,))
-                                        cur.execute("""
-                                            INSERT INTO ledger (symbol, action, qty, price, total_value, pnl_pct, balance)
-                                            VALUES (%s, 'SELL', %s, %s, %s, %s, %s);
-                                        """, (sym, qty, price, revenue, pnl_pct, cash))
-                                        
-                                        reason = f"TARGET HIT ({'PROFIT +1.5%' if pnl_pct>=1.5 else 'STOP LOSS -1.0%'})"
-                                        cur.execute("INSERT INTO decision_logs (symbol, price, status, reason) VALUES (%s, %s, 'EXECUTED SELL', %s);", (sym, price, reason))
+                                    if sell_signal:
+                                        target_type = "SELL (TAKE PROFIT)" if pnl_pct >= 2.5 else ("SELL (STOP LOSS)" if pnl_pct <= -1.2 else "SELL (TREND REVERSAL)")
+                                        ai_approved, ai_reason = consult_ai_supervisor(sym, price, target_type, cash, ind, pnl_pct)
+
+                                        if ai_approved:
+                                            revenue = round(qty * price, 2)
+                                            cash += revenue
+                                            cur.execute("UPDATE portfolio SET cash=%s WHERE id=1;", (cash,))
+                                            cur.execute("DELETE FROM holdings WHERE symbol=%s;", (sym,))
+                                            cur.execute("""
+                                                INSERT INTO ledger (symbol, action, qty, price, total_value, pnl_pct, balance)
+                                                VALUES (%s, 'SELL', %s, %s, %s, %s, %s);
+                                            """, (sym, qty, price, revenue, pnl_pct, cash))
+                                            cur.execute("INSERT INTO decision_logs (symbol, price, status, reason) VALUES (%s, %s, 'EXECUTED SELL', %s);", (sym, price, ai_reason))
+                                        else:
+                                            cur.execute("INSERT INTO decision_logs (symbol, price, status, reason) VALUES (%s, %s, 'AI VETOED SELL', %s);", (sym, price, ai_reason))
                                     else:
-                                        reason = f"HOLDING: P&L is {pnl_pct:+.2f}% (Target: +1.5% / -1.0%)"
+                                        reason = f"HOLDING: P&L {pnl_pct:+.2f}% | EMA9: ₹{ind['ema9']} / EMA21: ₹{ind['ema21']}"
                                         cur.execute("INSERT INTO decision_logs (symbol, price, status, reason) VALUES (%s, %s, 'HOLD', %s);", (sym, price, reason))
 
                                 else:
-                                    max_qty = int(cash // price)
-                                    if max_qty > 0:
-                                        qty = 1
-                                        cost = round(qty * price, 2)
-                                        cash -= cost
+                                    # Entry Conditions: EMA Crossover + Momentum RSI (< 65)
+                                    buy_signal = (ind['ema9'] > ind['ema21']) and (ind['rsi'] < 65)
+                                    if buy_signal:
+                                        # Allocate up to 25% of available cash per trade for higher compounding growth
+                                        trade_allocation = cash * 0.25
+                                        qty = int(trade_allocation // price)
 
-                                        cur.execute("UPDATE portfolio SET cash=%s WHERE id=1;", (cash,))
-                                        cur.execute("INSERT INTO holdings (symbol, qty, buy_price) VALUES (%s, %s, %s);", (sym, qty, price))
-                                        cur.execute("""
-                                            INSERT INTO ledger (symbol, action, qty, price, total_value, balance)
-                                            VALUES (%s, 'BUY', %s, %s, %s, %s);
-                                        """, (sym, qty, price, cost, cash))
+                                        if qty >= 1:
+                                            ai_approved, ai_reason = consult_ai_supervisor(sym, price, "BUY", cash, ind)
+                                            if ai_approved:
+                                                cost = round(qty * price, 2)
+                                                cash -= cost
+                                                cur.execute("UPDATE portfolio SET cash=%s WHERE id=1;", (cash,))
+                                                cur.execute("INSERT INTO holdings (symbol, qty, buy_price) VALUES (%s, %s, %s);", (sym, qty, price))
+                                                cur.execute("""
+                                                    INSERT INTO ledger (symbol, action, qty, price, total_value, balance)
+                                                    VALUES (%s, 'BUY', %s, %s, %s, %s);
+                                                """, (sym, qty, price, cost, cash))
+                                                cur.execute("INSERT INTO decision_logs (symbol, price, status, reason) VALUES (%s, %s, 'EXECUTED BUY', %s);", (sym, price, ai_reason))
+                                            else:
+                                                cur.execute("INSERT INTO decision_logs (symbol, price, status, reason) VALUES (%s, %s, 'AI VETOED BUY', %s);", (sym, price, ai_reason))
+                                        else:
+                                            reason = f"INSUFFICIENT FUNDS: Required ₹{price:.2f}, Cash Available ₹{cash:.2f}"
+                                            cur.execute("INSERT INTO decision_logs (symbol, price, status, reason) VALUES (%s, %s, 'REJECTED', %s);", (sym, price, reason))
 
-                                        reason = f"APPROVED: Bought {qty} qty at ₹{price:.2f}"
-                                        cur.execute("INSERT INTO decision_logs (symbol, price, status, reason) VALUES (%s, %s, 'EXECUTED BUY', %s);", (sym, price, reason))
-                                    else:
-                                        reason = f"REJECTED: Insufficient cash balance (₹{cash:.2f}) for stock price ₹{price:.2f}"
-                                        cur.execute("INSERT INTO decision_logs (symbol, price, status, reason) VALUES (%s, %s, 'REJECTED', %s);", (sym, price, reason))
+                            except Exception as ex:
+                                print(f"Error processing {sym}: {ex}")
 
-                            total_portfolio_valuation = round(cash + holdings_value, 2)
-                            cur.execute("INSERT INTO valuation_history (total_value) VALUES (%s);", (total_portfolio_valuation,))
-
-                            cur.execute("DELETE FROM decision_logs WHERE id NOT IN (SELECT id FROM decision_logs ORDER BY id DESC LIMIT 100);")
-                            cur.execute("DELETE FROM valuation_history WHERE id NOT IN (SELECT id FROM valuation_history ORDER BY id DESC LIMIT 100);")
-                            conn.commit()
+                        total_portfolio_valuation = round(cash + holdings_value, 2)
+                        cur.execute("INSERT INTO valuation_history (total_value) VALUES (%s);", (total_portfolio_valuation,))
+                        cur.execute("DELETE FROM decision_logs WHERE id NOT IN (SELECT id FROM decision_logs ORDER BY id DESC LIMIT 100);")
+                        cur.execute("DELETE FROM valuation_history WHERE id NOT IN (SELECT id FROM valuation_history ORDER BY id DESC LIMIT 100);")
+                        conn.commit()
 
         except Exception as e:
             print(f"Trading loop exception: {e}")
 
-        await asyncio.sleep(15)
+        await asyncio.sleep(20)
 
 @app.get("/", response_class=HTMLResponse)
 def web_dashboard():
@@ -205,39 +280,46 @@ def web_dashboard():
             cur.execute("SELECT * FROM holdings;")
             holdings = cur.fetchall()
 
-            cur.execute("SELECT timestamp, symbol, action AS type, qty, price, pnl_pct, balance, '' AS reason FROM ledger ORDER BY id DESC LIMIT 40;")
+            cur.execute("SELECT timestamp, symbol, action, qty, price, pnl_pct FROM ledger ORDER BY id ASC;")
+            all_trades = cur.fetchall()
+
+            cur.execute("SELECT timestamp, symbol, action AS type, qty, price, pnl_pct, balance, '' AS reason FROM ledger ORDER BY id DESC LIMIT 30;")
             ledger_logs = cur.fetchall()
 
-            cur.execute("SELECT timestamp, symbol, status AS type, 0 AS qty, price, NULL AS pnl_pct, NULL AS balance, reason FROM decision_logs WHERE status IN ('HOLD', 'REJECTED', 'MARKET CLOSED') ORDER BY id DESC LIMIT 40;")
+            cur.execute("SELECT timestamp, symbol, status AS type, 0 AS qty, price, NULL AS pnl_pct, NULL AS balance, reason FROM decision_logs WHERE status NOT IN ('EXECUTED BUY', 'EXECUTED SELL') ORDER BY id DESC LIMIT 30;")
             decision_logs_data = cur.fetchall()
 
             cur.execute("SELECT timestamp, total_value FROM valuation_history ORDER BY id ASC;")
             history = cur.fetchall()
 
-            cur.execute("SELECT timestamp, pnl_pct, qty, price FROM ledger WHERE action='SELL' ORDER BY id ASC;")
-            sell_trades = cur.fetchall()
+    unified_logs = sorted(ledger_logs + decision_logs_data, key=x: x['timestamp'], reverse=True)[:35]
 
-    # Combine ledger and decision logs into one register sorted by timestamp IST
-    unified_logs = sorted(ledger_logs + decision_logs_data, key=lambda x: x['timestamp'], reverse=True)[:35]
-
-    # Chart 1: Valuation
-    chart_labels = [to_ist_time_str(h['timestamp']) for h in history] if history else ["Now"]
+    # Date and Time charts formatting
+    chart_labels = [to_ist_datetime_str(h['timestamp']) for h in history] if history else ["Now"]
     chart_values = [h['total_value'] for h in history] if history else [INITIAL_CASH]
 
-    # Chart 2: Cumulative Platform Profit
+    # Buy / Sell Chart scatter points setup
+    buy_scatter = []
+    sell_scatter = []
     cum_profit = 0.0
     pnl_labels = []
     pnl_values = []
-    for st in sell_trades:
-        time_str = to_ist_time_str(st['timestamp'])
-        pnl_pct = st['pnl_pct'] or 0.0
-        qty = st['qty'] or 1
-        price = st['price'] or 0.0
-        buy_price = price / (1 + pnl_pct / 100.0) if (1 + pnl_pct / 100.0) != 0 else price
-        trade_pnl = (price - buy_price) * qty
-        cum_profit += trade_pnl
-        pnl_labels.append(time_str)
-        pnl_values.append(round(cum_profit, 2))
+
+    for tr in all_trades:
+        ts_str = to_ist_datetime_str(tr['timestamp'])
+        point = {"x": ts_str, "y": tr['price'], "symbol": tr['symbol'], "qty": tr['qty']}
+        if tr['action'] == 'BUY':
+            buy_scatter.append(point)
+        else:
+            sell_scatter.append(point)
+            pnl_pct = tr['pnl_pct'] or 0.0
+            qty = tr['qty'] or 1
+            price = tr['price'] or 0.0
+            buy_price = price / (1 + pnl_pct / 100.0) if (1 + pnl_pct / 100.0) != 0 else price
+            trade_pnl = (price - buy_price) * qty
+            cum_profit += trade_pnl
+            pnl_labels.append(ts_str)
+            pnl_values.append(round(cum_profit, 2))
 
     if not pnl_labels:
         pnl_labels = ["Now"]
@@ -247,7 +329,7 @@ def web_dashboard():
 
     unified_rows = []
     for log in unified_logs:
-        t_str = to_ist_time_str(log['timestamp'])
+        t_str = to_ist_datetime_str(log['timestamp'])
         log_type = log['type']
         
         if log_type == 'BUY':
@@ -259,6 +341,10 @@ def web_dashboard():
             pnl_val = log['pnl_pct'] or 0.0
             pnl_disp = f"{pnl_val:+.2f}%"
             details = f"Sold {log['qty']} qty @ ₹{log['price']:.2f}"
+        elif 'AI VETOED' in log_type:
+            badge = "<span class='text-purple-400 font-semibold'>AI VETOED</span>"
+            pnl_disp = "-"
+            details = log['reason']
         elif log_type == 'HOLD':
             badge = "<span class='text-amber-400 font-semibold'>HOLD</span>"
             pnl_disp = "-"
@@ -273,7 +359,6 @@ def web_dashboard():
             details = log['reason']
 
         price_disp = f"₹{log['price']:.2f}" if log['price'] else "-"
-        
         unified_rows.append(
             f"<tr class='border-b border-slate-800'>"
             f"<td class='p-2 text-slate-400'>{t_str}</td>"
@@ -291,7 +376,7 @@ def web_dashboard():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Live Algo Trading Engine</title>
+        <title>Quant Engine - AI Supervised</title>
         <script src="https://cdn.tailwindcss.com"></script>
         <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
         <meta http-equiv="refresh" content="10">
@@ -300,41 +385,41 @@ def web_dashboard():
         <div class="max-w-6xl mx-auto space-y-6">
             <div class="flex justify-between items-center bg-slate-900 p-6 rounded-xl border border-slate-800">
                 <div>
-                    <h1 class="text-2xl font-bold text-emerald-400">Live Trade Action Register</h1>
-                    <p class="text-slate-400 text-sm">Status: IST Market Hours Active (09:15 AM - 03:30 PM) | Live Tracking</p>
+                    <h1 class="text-2xl font-bold text-emerald-400 flex items-center gap-2">
+                        <span>📈 Quant Algo Engine (EMA + RSI Strategy)</span>
+                    </h1>
+                    <p class="text-slate-400 text-sm">Trading Hours: 09:15-15:30 IST | Gemini Risk Guardrails Active</p>
                 </div>
-                <div class="flex items-center gap-6">
-                    <div class="text-right">
-                        <div class="text-xs text-slate-400">Available Cash</div>
-                        <div class="text-3xl font-extrabold text-white">₹{cash:.2f}</div>
-                    </div>
+                <div class="text-right">
+                    <div class="text-xs text-slate-400">Available Cash</div>
+                    <div class="text-3xl font-extrabold text-white">₹{cash:.2f}</div>
                 </div>
-            </div>
-
-            <div class="flex gap-4">
-                <a href="/export/excel" class="bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-2 px-4 rounded-lg">📊 Download Excel Register</a>
-                <a href="/export/csv" class="bg-blue-600 hover:bg-blue-500 text-white font-bold py-2 px-4 rounded-lg">📄 Download CSV Report</a>
             </div>
 
             <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
                 <div class="bg-slate-900 p-6 rounded-xl border border-slate-800">
-                    <h2 class="text-lg font-semibold mb-4 text-emerald-400">Live Portfolio Valuation Curve (Cash + Stocks)</h2>
+                    <h2 class="text-lg font-semibold mb-4 text-emerald-400">Portfolio Valuation Curve (IST)</h2>
                     <canvas id="balanceChart" height="140"></canvas>
                 </div>
                 <div class="bg-slate-900 p-6 rounded-xl border border-slate-800">
-                    <h2 class="text-lg font-semibold mb-4 text-blue-400">Platform Realized Profit Curve (Cumulative ₹)</h2>
+                    <h2 class="text-lg font-semibold mb-4 text-blue-400">Realized Cumulative Profit (₹)</h2>
                     <canvas id="pnlChart" height="140"></canvas>
                 </div>
             </div>
 
             <div class="bg-slate-900 p-6 rounded-xl border border-slate-800">
-                <h2 class="text-lg font-semibold mb-4 text-amber-400">Unified Activity & Execution Register (Executions, Holds & Rejections)</h2>
+                <h2 class="text-lg font-semibold mb-4 text-purple-400">Buy & Sell Executions (Date & Time IST)</h2>
+                <canvas id="tradesChart" height="110"></canvas>
+            </div>
+
+            <div class="bg-slate-900 p-6 rounded-xl border border-slate-800">
+                <h2 class="text-lg font-semibold mb-4 text-amber-400">Activity & Execution Register</h2>
                 <div class="overflow-x-auto">
                     <table class="w-full text-left text-sm text-slate-300">
                         <tr class="border-b border-slate-800 text-slate-400">
-                            <th>Time (IST)</th><th>Symbol</th><th>Action / Status</th><th>Price</th><th>P&L (%)</th><th>Analysis / Reason</th>
+                            <th>Date & Time (IST)</th><th>Symbol</th><th>Action / Status</th><th>Price</th><th>P&L (%)</th><th>Strategy & AI Analysis</th>
                         </tr>
-                        {unified_rows_html if unified_rows_html else "<tr><td colspan='6' class='py-2 text-slate-500'>Evaluating watchlist rules...</td></tr>"}
+                        {unified_rows_html if unified_rows_html else "<tr><td colspan='6' class='py-2 text-slate-500'>Evaluating strategy...</td></tr>"}
                     </table>
                 </div>
             </div>
@@ -343,43 +428,29 @@ def web_dashboard():
                 <h2 class="text-lg font-semibold mb-4 text-emerald-400">Open Positions</h2>
                 <table class="w-full text-left text-sm text-slate-300">
                     <tr class="border-b border-slate-800 text-slate-400"><th>Symbol</th><th>Qty</th><th>Buy Price</th></tr>
-                    {holdings_rows if holdings_rows else "<tr><td colspan='3' class='py-2 text-slate-500'>No open positions</td></tr>"}
+                    {holdings_rows if holdings_rows else "<tr><td colspan='3' class='py-2 text-slate-500'>No active positions</td></tr>"}
                 </table>
-            </div>
-
-            <div class="mt-8 text-center text-slate-500 text-sm font-medium py-4 border-t border-slate-800">
-                Made by Imtex
             </div>
         </div>
 
         <script>
-            const ctx1 = document.getElementById('balanceChart').getContext('2d');
-            new Chart(ctx1, {{
+            new Chart(document.getElementById('balanceChart').getContext('2d'), {{
                 type: 'line',
                 data: {{
                     labels: {chart_labels},
                     datasets: [{{
-                        label: 'Portfolio Valuation (₹)',
+                        label: 'Valuation (₹)',
                         data: {chart_values},
                         borderColor: '#10b981',
                         backgroundColor: 'rgba(16, 185, 129, 0.1)',
                         fill: true,
-                        tension: 0.2,
-                        pointRadius: 2
+                        tension: 0.2
                     }}]
                 }},
-                options: {{
-                    responsive: true,
-                    plugins: {{ legend: {{ display: false }} }},
-                    scales: {{
-                        x: {{ grid: {{ color: '#1e293b' }}, ticks: {{ color: '#94a3b8' }} }},
-                        y: {{ grid: {{ color: '#1e293b' }}, ticks: {{ color: '#94a3b8' }} }}
-                    }}
-                }}
+                options: {{ responsive: true, plugins: {{ legend: {{ display: false }} }} }}
             }});
 
-            const ctx2 = document.getElementById('pnlChart').getContext('2d');
-            new Chart(ctx2, {{
+            new Chart(document.getElementById('pnlChart').getContext('2d'), {{
                 type: 'line',
                 data: {{
                     labels: {pnl_labels},
@@ -389,16 +460,44 @@ def web_dashboard():
                         borderColor: '#3b82f6',
                         backgroundColor: 'rgba(59, 130, 246, 0.1)',
                         fill: true,
-                        tension: 0.2,
-                        pointRadius: 2
+                        tension: 0.2
                     }}]
+                }},
+                options: {{ responsive: true, plugins: {{ legend: {{ display: false }} }} }}
+            }});
+
+            const buyPoints = {json.dumps(buy_scatter)};
+            const sellPoints = {json.dumps(sell_scatter)};
+
+            new Chart(document.getElementById('tradesChart').getContext('2d'), {{
+                type: 'scatter',
+                data: {{
+                    datasets: [
+                        {{
+                            label: 'BUY Executions',
+                            data: buyPoints,
+                            backgroundColor: '#10b981',
+                            pointRadius: 6
+                        }},
+                        {{
+                            label: 'SELL Executions',
+                            data: sellPoints,
+                            backgroundColor: '#f43f5e',
+                            pointRadius: 6
+                        }}
+                    ]
                 }},
                 options: {{
                     responsive: true,
-                    plugins: {{ legend: {{ display: false }} }},
-                    scales: {{
-                        x: {{ grid: {{ color: '#1e293b' }}, ticks: {{ color: '#94a3b8' }} }},
-                        y: {{ grid: {{ color: '#1e293b' }}, ticks: {{ color: '#94a3b8' }} }}
+                    plugins: {{
+                        tooltip: {{
+                            callbacks: {{
+                                label: function(ctx) {{
+                                    let p = ctx.raw;
+                                    return p.symbol + ' | Qty: ' + p.qty + ' @ ₹' + p.y + ' (' + p.x + ')';
+                                }}
+                            }}
+                        }}
                     }}
                 }}
             }});
@@ -418,16 +517,4 @@ def export_excel():
         open(file_path, "rb"),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": "attachment; filename=Trade_Register.xlsx"}
-    )
-
-@app.get("/export/csv")
-def export_csv():
-    with get_db() as conn:
-        df = pd.read_sql("SELECT * FROM ledger ORDER BY id ASC;", conn)
-    file_path = "/tmp/Trade_Register.csv"
-    df.to_csv(file_path, index=False)
-    return StreamingResponse(
-        open(file_path, "rb"),
-        media_type="text/csv",
-        headers={"Content-Disposition": "attachment; filename=Trade_Register.csv"}
     )
