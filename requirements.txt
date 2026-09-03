@@ -1,6 +1,5 @@
 fastapi
 uvicorn
-yfinance
 pandas
-psycopg2-binary
+yfinance
 openpyxl
