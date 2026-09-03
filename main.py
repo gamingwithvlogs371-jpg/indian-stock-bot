@@ -1,6 +1,4 @@
-from pathlib import Path
-
-code = r'''import os
+import os
 import math
 import asyncio
 from datetime import datetime, timezone, timedelta
@@ -1452,10 +1450,3 @@ if __name__ == "__main__":
         port=int(os.getenv("PORT", "8000")),
         reload=False,
     )
-'''
-
-path = Path("/mnt/data/main.py")
-path.write_text(code, encoding="utf-8")
-
-print(f"Created {path}")
-print(f"Lines: {len(code.splitlines())}")
